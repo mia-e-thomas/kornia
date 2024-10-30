@@ -84,14 +84,18 @@ class RANSAC(Module):
         else:
             raise NotImplementedError(f"{model_type} is unknown. Try one of {self.supported_models}")
 
-    def sample(self, sample_size: int, pop_size: int, batch_size: int, device: Device = torch.device("cpu")) -> Tensor:
+    def sample(self, sample_size: int, batch_size: int, weights: Tensor) -> Tensor:
         """Minimal sampler, but unlike traditional RANSAC we sample in batches to get benefit of the parallel
         processing, esp.
 
         on GPU.
         """
-        rand = torch.rand(batch_size, pop_size, device=device)
-        _, out = rand.topk(k=sample_size, dim=1)
+        # Probability (divide by sum)
+        prob = weights/torch.sum(weights) # N
+
+        # Sample with weights
+        out = torch.multinomial(prob.expand(batch_size,-1), sample_size, replacement=False) # BxN->Bx4
+
         return out
 
     @staticmethod
@@ -128,14 +132,20 @@ class RANSAC(Module):
         inliers_best = inl[best_model_idx]
         return model_best, inliers_best, best_model_score
 
-    def remove_bad_samples(self, kp1: Tensor, kp2: Tensor) -> Tuple[Tensor, Tensor]:
+    def remove_bad_samples(self, kp1: Tensor, kp2: Tensor, weights: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """"""
         # ToDo: add (model-specific) verification of the samples,
         # E.g. constraints on not to be a degenerate sample
+        mask = torch.ones([kp1.shape[0]], dtype=bool, device=kp1.device) # B
+
         if self.model_type == "homography":
-            mask = sample_is_valid_for_homography(kp1, kp2)
-            return kp1[mask], kp2[mask]
-        return kp1, kp2
+            # Check colinearity
+            mask *= sample_is_valid_for_homography(kp1, kp2)
+
+        # Make sure no weights are zero
+        mask *= torch.all(weights,dim=1)  
+
+        return kp1[mask], kp2[mask], weights[mask] # B'x4x2, B'x4x2, B'x4, B'<=B
 
     def remove_bad_models(self, models: Tensor) -> Tensor:
         # ToDo: add more and better degenerate model rejection
@@ -172,6 +182,14 @@ class RANSAC(Module):
                     f" [{self.minimal_sample_size}, 2, 2],                                  got {kp1.shape},"
                     f" {kp2.shape}"
                 )
+        if weights is not None: 
+            KORNIA_CHECK_SHAPE(weights, ["N"])
+            if not (kp1.shape[0] == weights.shape[0]): 
+                raise ValueError(
+                    f"weights should have \
+                                 one value per keypoint. Expected [{kp1.shape[0]}], \
+                                 got {weights.shape}"
+                )
 
     def forward(self, kp1: Tensor, kp2: Tensor, weights: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         r"""Main forward method to execute the RANSAC algorithm.
@@ -179,24 +197,31 @@ class RANSAC(Module):
         Args:
             kp1: source image keypoints :math:`(N, 2)`.
             kp2: distance image keypoints :math:`(N, 2)`.
-            weights: optional correspondences weights. Not used now.
+            weights: correspondences weights :math:`(N)`.
 
         Returns:
             - Estimated model, shape of :math:`(1, 3, 3)`.
             - The inlier/outlier mask, shape of :math:`(1, N)`, where N is number of input correspondences.
         """
+        if weights is None: weights = torch.ones([kp1.shape[0]], dtype=kp1.dtype, device=kp1.device)
+
         self.validate_inputs(kp1, kp2, weights)
-        best_score_total: float = float(self.minimal_sample_size)
+
+        # Initialize
+        best_score_total: float = float(self.minimal_sample_size) # TODO: Change to 0 for full weighted ransac
         num_tc: int = len(kp1)
         best_model_total = zeros(3, 3, dtype=kp1.dtype, device=kp1.device)
         inliers_best_total: Tensor = zeros(num_tc, 1, device=kp1.device, dtype=torch.bool)
+
         for i in range(self.max_iter):
             # Sample minimal samples in batch to estimate models
-            idxs = self.sample(self.minimal_sample_size, num_tc, self.batch_size, kp1.device)
-            kp1_sampled = kp1[idxs]
-            kp2_sampled = kp2[idxs]
+            idxs = self.sample(self.minimal_sample_size, self.batch_size, weights)
+            kp1_sampled = kp1[idxs] # Bx4x2
+            kp2_sampled = kp2[idxs] # Bx4x2
+            weights_sampled = weights[idxs] # Bx4
 
-            kp1_sampled, kp2_sampled = self.remove_bad_samples(kp1_sampled, kp2_sampled)
+            kp1_sampled, kp2_sampled, weights_sampled = self.remove_bad_samples(kp1_sampled, kp2_sampled, weights_sampled)
+
             if len(kp1_sampled) == 0:
                 continue
             # Estimate models
